@@ -10,22 +10,9 @@ cursor = 0
 def draw(screen):
     screen.clear()
 
-    # ==========================================================
-    # INITIALIZE THE DISPLAY
-    #
-    # Display the document with the cursor at the current
-    # cursor position.
-    #
-    # Example
-    #
-    # text    = "Hello"
-    # cursor  = 0
-    #
-    # display = "|Hello"
-    #
-    # ---------------- TODO ----------------
+    # DRAW DISPLAY
 
-    display = text
+    display = text[:cursor] + "|" + text[cursor:]
 
     # ----------------------------------------
 
@@ -52,155 +39,80 @@ def main(screen):
         if key == 27:
             break
 
-        # ==========================================================
         # LEFT ARROW
-        #
-        # Move the cursor one position to the left.
-        #
-        # Example
-        #
-        # Before
-        # text    = "Hello"
-        # cursor  = 3
-        # display = "Hel|lo"
-        #
-        # After
-        # text    = "Hello"
-        # cursor  = 2
-        # display = "He|llo"
-        #
-        # ---------------- ANSWER ----------------
 
         elif key == curses.KEY_LEFT:
 
-            ...
-
-            display = ...
+            if cursor > 0:
+                cursor -= 1
 
         # ----------------------------------------
 
-        # ==========================================================
         # RIGHT ARROW
-        #
-        # Move the cursor one position to the right.
-        #
-        # Example
-        #
-        # Before
-        # text    = "Hello"
-        # cursor  = 3
-        # display = "Hel|lo"
-        #
-        # After
-        # text    = "Hello"
-        # cursor  = 4
-        # display = "Hell|o"
-        #
-        # ---------------- ANSWER ----------------
 
         elif key == curses.KEY_RIGHT:
 
-            ...
-
-            display = ...
+            if cursor < len(text):
+                cursor += 1
 
         # ----------------------------------------
 
-        # ==========================================================
-        # BACKSPACE
-        #
-        # Delete the character immediately before the cursor.
-        #
-        # Example
-        #
-        # Before
-        # text    = "Hello"
-        # cursor  = 3
-        # display = "Hel|lo"
-        #
-        # After
-        # text    = "Helo"
-        # cursor  = 2
-        # display = "He|lo"
-        #
-        # ---------------- ANSWER ----------------
+        # BACK SPACE
 
         elif key in (8, 127, curses.KEY_BACKSPACE):
 
-            ...
-
-            display = ...
+            if cursor > 0:
+                text = text[:cursor-1] + text[cursor:]
+                cursor -= 1
 
         # ----------------------------------------
 
-        # ==========================================================
-        # ENTER
-        #
-        # Insert a newline at the cursor.
-        #
-        # Example
-        #
-        # Before
-        # text    = "Hello"
-        # cursor  = 3
-        # display = "Hel|lo"
-        #
-        # After
-        # text    = "Hel\nlo"
-        # cursor  = 4
-        # display = "Hel\n|lo"
-        #
-        # ---------------- ANSWER ----------------
+        # NEW LINE
 
         elif key == 10:
 
-            ...
+            text = text[:cursor] + "\n" + text[cursor:]
+            cursor += 1
 
-            display = ...
-
-        # ----------------------------------------
-
-        # ==========================================================
         # INSERT CHARACTER
-        #
-        # Insert the typed character at the cursor.
-        #
-        # Example
-        #
-        # Before
-        # text    = "Hello"
-        # cursor  = 3
-        # display = "Hel|lo"
-        #
-        # Typing X
-        #
-        # After
-        # text    = "HelXlo"
-        # cursor  = 4
-        # display = "HelX|lo"
-        #
-        # ---------------- ANSWER ----------------
 
         elif 32 <= key <= 126:
 
-            ...
-
-            display = ...
+            text = text[:cursor] + chr(key) + text[cursor:]
+            cursor += 1
 
         # ----------------------------------------
 
-        #BONUS: Can you figure out how to select one line up/down by yourself?
+        #BONUS: Can you figure out how to select one line up/down by yourself? 
 
         elif key == curses.KEY_UP:
+            current_line_start = text.rfind("\n", 0, cursor) + 1
+            column = cursor - current_line_start
+            if current_line_start > 0:
+                previous_line_end = current_line_start - 1
+                previous_line_start = text.rfind("\n", 0, previous_line_end) + 1
 
-            ...
+                previous_line_length = previous_line_end - previous_line_start
 
-            display = ...
+                cursor = previous_line_start + min(column, previous_line_length)
+               
 
         elif key == curses.KEY_DOWN:
+            current_line_start = text.rfind("\n", 0, cursor) + 1
+            column = cursor - current_line_start
 
-            ...
+            current_line_end = text.find("\n", cursor)
 
-            display = ...
+            if current_line_end != -1:
+                next_line_start = current_line_end + 1
+                next_line_end = text.find("\n", next_line_start)
+
+                next_line_length = next_line_end - next_line_start
+
+                cursor = next_line_start + min(column, next_line_length)
+            else:
+                    next_line_end = len(text)
+                    cursor = next_line_end
+
 
 curses.wrapper(main)
