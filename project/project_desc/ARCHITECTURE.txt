@@ -1,0 +1,222 @@
+═══════════════════════════════════════════════════════════════════════════════
+              CUAD-STLF — COMPLETE END-TO-END ARCHITECTURE
+     Calibrated Uncertainty from Agent Disagreement — Short-Term Load Forecasting
+═══════════════════════════════════════════════════════════════════════════════
+
+FRAMEWORK:   LangGraph (Python 3.10+)
+INTERFACES:  CLI (argparse) · FastAPI (REST + SSE) · MCP stdio server
+MODEL PANEL: Ridge · LightGBM · XGBoost · LSTM (torch) · SARIMA (statsmodels) ·
+             Quantile Regression (sklearn) · Chronos (Amazon foundation TS, zero-shot)
+REGIONS:     ISO-NE (default, ground-truth path) · PJM · MISO · CAISO · NYISO ·
+             ERCOT · SPP (via EIA Open Data) · synthetic fallback with zero credentials
+
+See also: BACKEND.txt (API/CLI/MCP contracts) · FRAMEWORK.txt (agentic mechanics,
+concept-by-concept) · PROGRESS.txt (what's built so far and what's next).
+
+═══════════════════════════════════════════════════════════════════════════════
+WHAT IS BEING SOLVED
+═══════════════════════════════════════════════════════════════════════════════
+
+INPUT:
+  Hourly electricity grid load history + weather + calendar for one ISO region,
+  plus a forecast horizon (hours ahead).
+
+OUTPUT:
+  A point forecast PLUS a calibrated prediction interval, not just one number:
+
+    point:       [14,201, 14,350, ...]                     MW, one per hour
+    interval:    lo=[13,900,...] hi=[14,600,...] @ alpha=0.1 (90% PI)
+    attribution: per-agent deviation from consensus (who pulled the number
+                 up/down, and by how much)
+
+  Example: "14,200 MW, with 90% confidence the true value falls in
+            [13,900, 14,600] MW."
+
+WHY A SINGLE MODEL ISN'T ENOUGH
+  A single forecaster reports the same apparent confidence on a calm Tuesday
+  and during a heatwave — exactly when it is most likely to be wrong. There is
+  no internal signal telling an operator "trust this number less right now."
+
+THE APPROACH — DISAGREEMENT AS THE UNCERTAINTY SIGNAL
+  Run several structurally different models on the same data (linear, tree-
+  boosted, recurrent, statistical, foundation-model). When they agree, that is
+  evidence of a well-understood regime → narrow interval. When they disagree,
+  that is evidence of a hard/novel regime → wide interval. Raw disagreement is
+  only a heuristic, so it is passed through conformal calibration, which gives
+  a distribution-free, finite-sample coverage guarantee: a stated 90% interval
+  should actually contain the true value ~90% of the time on held-out data.
+
+═══════════════════════════════════════════════════════════════════════════════
+HIGH-LEVEL PIPELINE
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  SOURCES:  ISO-NE / EIA hourly load  ·  Open-Meteo / NOAA weather  ·        │
+│            holiday/weekend calendar   (synthetic fallback, zero creds)     │
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  R1  INGEST     feature_builder.py → features.parquet + splits.json        │
+│                 lags (1,2,6,12,24,48,168h) · rolling mean/std/max/min ·     │
+│                 HDD/CDD · Fourier time features · event flags              │
+│                 (holiday/heatwave/storm) · leakage audit (≥1h shift only)  │
+│                 splits: 70% train / 15% calibration / 15% test, temporal   │
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  R2  PANEL      run every model-agent in parallel (ThreadPoolExecutor)     │
+│                                                                             │
+│   ┌───────┐ ┌────────┐ ┌────────┐ ┌──────┐ ┌────────┐ ┌────────┐ ┌───────┐│
+│   │ Ridge │ │LightGBM│ │XGBoost │ │ LSTM │ │ SARIMA │ │Quantile│ │Chronos││
+│   └───┬───┘ └───┬────┘ └───┬────┘ └──┬───┘ └───┬────┘ └───┬────┘ └───┬───┘│
+│       └─────────┴──────────┴─────────┴─────────┴──────────┴──────────┘    │
+│                                     │ ŷ per agent (AgentOutput)            │
+│                 A failing agent falls back to "repeat last known value"   │
+│                 rather than crashing the panel (see FRAMEWORK.txt Concept 2)│
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  R3  AGGREGATE  point = combine(ŷ_i)        mean/median (config: combine_method)│
+│                 disagreement = spread(ŷ_i)  std across agents (config: spread_metric)│
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  R4  CALIBRATE  re-run the panel one step at a time over a calibration     │
+│                 window (≤ calibration_max_steps, default 50) →             │
+│                 q̂ = conformal quantile of |y - point| / disagreement       │
+│                 interval = point ± q̂ · disagreement                        │
+│                 modes: split | constant | two_sided | adaptive (ACI)       │
+│                 attribution = per-agent deviation from consensus           │
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  R5  OUTPUT     write runs/<run_id>/{r1..r5}_*.json + meta/index.json      │
+│                 optional human gate: "reject" routes back to R2 (re-panel)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+LANGGRAPH STATE OBJECT  (ForecastState — travels through every node)
+═══════════════════════════════════════════════════════════════════════════════
+
+ForecastState = {
+    "run_id":         str,
+    "region":         str,                    # e.g. "ISO-NE"
+    "horizon":        int,                    # hours
+    "config_hash":    str,                    # from splits.json, for reproducibility
+    "features_ref":   str,                    # path to features.parquet
+    "splits_ref":     str,                    # path to splits.json
+    "agent_outputs":  list[dict],             # one AgentOutput per model-agent
+    "point":          list[float],            # aggregated point forecast
+    "disagreement":   list[float],            # per-hour spread across agents
+    "interval":       dict,                   # {alpha, lo, hi, q_hat}
+    "attribution":    dict,                   # per-agent deviation from consensus
+    "operator_hint":  str | None,             # optional human context injection
+    "gate_decision":  str | None,             # "auto" | "approve" | "reject"
+    "audit_path":     str,                    # runs/<run_id>/
+    "telemetry":      list[dict],             # per-stage timing/cost events
+    "dry_run":        bool,
+}
+
+═══════════════════════════════════════════════════════════════════════════════
+LANGGRAPH GRAPH STRUCTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+NODES (src/cuad/orchestration/nodes/):
+  r1_ingest      → loads/builds features + splits, records config_hash
+  r2_panel       → calls every model-agent (parallel via ThreadPoolExecutor)
+  r3_aggregate   → point = combine(agent outputs), disagreement = spread(...)
+  r4_calibrate   → conformal calibration → q̂, interval, attribution
+  r5_output      → applies optional human gate, writes audit bundle
+
+EDGES (src/cuad/orchestration/graph.py):
+  START        → r1_ingest
+  r1_ingest    → r2_panel
+  r2_panel     → r3_aggregate
+  r3_aggregate → r4_calibrate
+  r4_calibrate → r5_output
+  r5_output    → route_after_output() → "r2_panel" (if gate_decision == "reject")
+                                       → END        (otherwise)
+
+CONDITIONAL EDGE (src/cuad/orchestration/gate.py):
+  def route_after_output(state):
+      if state.get("gate_decision") == "reject":
+          return "r2_panel"
+      return "end"
+
+Every stage can be independently resumed via `--from-run <id> --stage r3` (see
+BACKEND.txt for the CLI contract) — hydrate_from_run() rebuilds ForecastState
+from a prior run's saved artifacts up to the requested stage.
+
+═══════════════════════════════════════════════════════════════════════════════
+THE MODEL PANEL — WHY THESE 7 AND NOT OTHERS
+═══════════════════════════════════════════════════════════════════════════════
+
+  Ridge Regression       linear baseline; always available; fast
+  LightGBM               gradient-boosted trees; strong default
+  XGBoost                alternative GBDT; optional panel member
+  LSTM                   sequence model, 168h lookback; requires torch
+  SARIMA                 seasonal statistical model; requires statsmodels
+  Quantile Regression    sklearn QuantileRegressor; direct interval baseline
+  Chronos (foundation)   Amazon's zero-shot time-series foundation model;
+                         requires chronos-forecasting
+
+  Default active panel (.env PANELCAST_AGENTS_PANEL): ridge, lightgbm, lstm,
+  foundation_ts.
+
+  Heterogeneity is the point: a linear model, a tree ensemble, a recurrent
+  net, and a zero-shot foundation model fail in different ways on the same
+  data. That's what makes their disagreement an informative signal instead of
+  just noise from N copies of the same architecture.
+
+  All 7 implement one shared interface (BaseAgent.fit / .predict) — see
+  FRAMEWORK.txt Concept 2 (TOOLS) for the exact contract.
+
+═══════════════════════════════════════════════════════════════════════════════
+FEATURE SET (src/cuad/data/feature_builder.py)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Load lags:       load_lag_1, _2, _6, _12, _24, _48, _168
+  Rolling stats:    load_roll_mean_24, _std_24, _mean_168, _max_24, _min_24
+  Load gradients:   load_diff_1 (1h Δ), load_diff_24 (24h Δ)
+  Weather:          temp_c, wind_ms, humidity, precip
+  Degree days:      hdd (heating), cdd (cooling)
+  Calendar:         hour, dow, month, is_holiday, is_weekend
+  Fourier time:     sin_hour, cos_hour, sin_dow, cos_dow, sin_month, cos_month
+  Interaction:      temp_x_hour
+  Event flags:      holiday, heatwave (temp ≥ 95th pct), storm (precip > 5mm), normal
+
+  All lag/rolling features are shifted ≥1h to prevent target leakage — this is
+  verified by an automated leakage audit before features.parquet is saved.
+
+═══════════════════════════════════════════════════════════════════════════════
+FILE STRUCTURE (as built)
+═══════════════════════════════════════════════════════════════════════════════
+
+energy-load-forecasting/                  (nested code repo — becomes GitHub cuad-stlf)
+├── main.py                       CLI entry point
+├── src/cuad/
+│   ├── cli.py                    argparse dispatcher (build-data/run/eval/cv-eval/serve/mcp)
+│   ├── config/settings.py        pydantic-settings, all env-driven
+│   ├── data/                     ingestion, feature_builder, splits, leakage_audit
+│   │   └── sources/               iso_ne.py, eia.py, weather.py, calendar.py, synthetic.py
+│   ├── agents/                   BaseAgent + 7 model-agents + registry + tools (run_panel)
+│   ├── uncertainty/              aggregate, disagreement, conformal, attribution
+│   ├── orchestration/            graph.py, state.py, gate.py, pipeline_runner.py,
+│   │                             audit.py, artifact_layout.py, nodes/r1..r5
+│   ├── eval/                     metrics, runner, ablation, time_series_cv, baselines,
+│   │                             grid_ops, plots, results
+│   ├── api/                      FastAPI app + routes + SSE streaming
+│   └── mcp/                      MCP stdio server + tool implementations
+├── data/{raw,processed}/         features.parquet + splits.json (gitignored raw/)
+├── runs/                          per-run audit bundles (gitignored)
+├── results/                       evaluation outputs (gitignored)
+├── saved_models/                  persisted agent checkpoints (gitignored)
+└── tests/                         pytest suite (agents, api, eval, mcp, orchestration)
+
+═══════════════════════════════════════════════════════════════════════════════
+WANT TO KNOW WHERE THINGS STAND TODAY?
+═══════════════════════════════════════════════════════════════════════════════
+
+This document describes the full end-to-end design — what the system is
+built to do once everything is running. For a dated log of what's been built
+so far and what the next tasks are, see PROGRESS.txt in this same folder.

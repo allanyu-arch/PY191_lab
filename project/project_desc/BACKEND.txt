@@ -1,0 +1,191 @@
+═══════════════════════════════════════════════════════════════════════════════
+              CUAD-STLF — BACKEND / INTERFACES REFERENCE
+        CLI · REST API (FastAPI) · MCP stdio server · Configuration
+═══════════════════════════════════════════════════════════════════════════════
+
+There is no frontend in this project (see FRONTEND.txt). Every consumer —
+human operator, downstream script, or Claude via MCP — goes through one of
+the three interfaces documented here. All three call the same underlying
+entrypoint: run_pipeline() in src/cuad/orchestration/pipeline_runner.py.
+
+═══════════════════════════════════════════════════════════════════════════════
+ENTRYPOINT ALL INTERFACES SHARE
+═══════════════════════════════════════════════════════════════════════════════
+
+  run_pipeline(
+      region: str = "ISO-NE",
+      horizon: int = 24,
+      dry_run: bool = False,
+      run_id: str | None = None,
+      ensure_data: bool = True,           # auto build-data if features.parquet missing
+      from_run: str | None = None,        # resume from a prior run
+      stage: str | None = None,           # which stage to resume at (r1..r5)
+      operator_hint: str | None = None,   # optional human context
+      gate_decision: str | None = None,   # "auto" | "approve" | "reject"
+      on_progress: Callable | None = None,
+  ) -> ForecastState
+
+  - Normal call: builds a fresh ForecastState, compiles the LangGraph, invokes it.
+  - Resume call (from_run + stage): rebuilds state from a prior run's saved
+    JSON artifacts up to `stage`, then runs the remaining stages forward.
+  - dry_run: skips all real work, just confirms wiring, writes no data.
+
+═══════════════════════════════════════════════════════════════════════════════
+1. CLI  (src/cuad/cli.py — installed as `cuad` after `pip install -e .`)
+═══════════════════════════════════════════════════════════════════════════════
+
+  cuad build-data [--days N]
+      PRD-1 step: fetch/load raw sources → features.parquet + splits.json.
+      --days limits to the last N days of history.
+
+  cuad run [--region ISO-NE] [--horizon 24] [--dry-run]
+           [--from-run <id> --stage r3]
+      Full R1→R5 pipeline. Prints run_id, audit path, first point/interval
+      value. --from-run + --stage resumes a prior run from that stage.
+
+  cuad eval [--benchmark] [--ablation] [--multiregion]
+      Standard: prints MAPE/RMSE/coverage etc., writes results/cuad_metrics.json
+      --benchmark:   full baseline comparison table
+      --ablation:    agent-panel and conformal-mode ablation studies
+                     → results/ablation_agent.json, ablation_conformal.json
+      --multiregion: sweep across ISO-NE, PJM, MISO (scripts/run_multiregion.py)
+
+  cuad cv-eval [--agent NAME] [--folds N] [--step N] [--fast]
+      Walk-forward cross-validation on the train split. No --agent = full panel.
+      --fast uses fewer folds / coarser step, for quick local iteration.
+
+  cuad cv-tune [--agent NAME] [--metric MAPE|RMSE|MAE] [--fast]
+      Hyperparameter search via time-series CV.
+      Writes results/best_params.json (consumed if PANELCAST_AGENTS_USE_TUNED_PARAMS=true).
+
+  cuad serve [--mcp]
+      Starts the FastAPI server (uvicorn) on PANELCAST_IF_API_PORT (default 8000).
+      --mcp just prints a reminder that MCP runs as a separate process.
+
+  cuad mcp
+      Starts the MCP stdio server (separate process from `serve`).
+
+═══════════════════════════════════════════════════════════════════════════════
+2. REST API  (src/cuad/api/ — FastAPI, mounted via create_app())
+═══════════════════════════════════════════════════════════════════════════════
+
+  GET  /health
+    → { "status": "ok", "features_ready": bool, "region": str }
+
+  POST /forecast
+    Body:  { "region": "ISO-NE", "horizon": 24, "operator_hint": null }
+    → { "run_id": str, "point": [...], "interval": {...}, "attribution": {...} }
+    409 if features.parquet is missing (run build-data first).
+    Internally: run_pipeline(ensure_data=False) — a full synchronous R1→R5 run.
+
+  GET  /runs/{run_id}
+    → the full persisted audit bundle (r1_features..r5_output + meta/index.json)
+    404 if the run_id doesn't exist under runs/.
+
+  GET  /runs/{run_id}/events
+    Server-Sent Events (SSE) replay of a COMPLETED run's telemetry, one event
+    per stage, ending with {"stage": "complete", "run_id": ...}.
+    Use for retrospective viewing, not live progress.
+
+  GET  /forecast/events?region=ISO-NE&horizon=24
+    SSE stream of a LIVE forecast run (src/cuad/api/sse.py: sse_event_stream).
+    409 if features.parquet is missing.
+
+  Notes for whoever builds a frontend on top of this later:
+    - /forecast is synchronous and a full run can take a while end to end
+      (see PROGRESS.txt for the current state of the calibration step).
+      /forecast/events is the SSE alternative for a responsive UI while a
+      run is in flight.
+    - There is no auth layer, no rate limiting, and no persistence beyond the
+      local runs/ directory yet — this is a local research API today, with
+      room to grow toward something production-ready later.
+
+═══════════════════════════════════════════════════════════════════════════════
+3. MCP SERVER  (src/cuad/mcp/ — stdio transport, for Claude/any MCP client)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Requires: pip install 'cuad-stlf[mcp]'   (adds the `mcp` Python package)
+  Run with: cuad mcp   (separate process from the REST API)
+
+  Exposed tools (src/cuad/mcp/tools.py):
+
+    forecast_load(region: str, horizon: int) -> dict
+      Runs the full pipeline, same as POST /forecast.
+      Returns { run_id, point, interval, attribution }.
+
+    get_uncertainty_interval(run_id: str) -> dict
+      Reads r4_calibrate.json for a COMPLETED run (does not re-run anything).
+      Returns { run_id, lo, hi, q_hat, alpha }.
+      Raises FileNotFoundError if the run/stage doesn't exist yet.
+
+    explain_drivers(run_id: str) -> dict
+      Reads the same r4 artifact's attribution block, summarizes each agent's
+      average MW deviation from consensus in plain text.
+
+  Design rule: only fast, read-mostly tools are exposed via MCP. The one
+  exception is forecast_load, which runs the whole pipeline synchronously —
+  see PROGRESS.txt for how long a full run currently takes end to end.
+
+═══════════════════════════════════════════════════════════════════════════════
+4. CONFIGURATION  (src/cuad/config/settings.py — pydantic-settings, .env-driven)
+═══════════════════════════════════════════════════════════════════════════════
+
+  All settings are optional with sane defaults; copy .env.example → .env to
+  override. Every key is prefixed PANELCAST_ (project's original working name)
+  except the raw credential vars.
+
+  DATA
+    PANELCAST_DATA_REGION                 default "ISO-NE"
+    PANELCAST_DATA_USE_SYNTHETIC_IF_MISSING  default true (demo mode, no creds needed)
+    PANELCAST_DATA_WEATHER_STATION        default "BOS"
+    PANELCAST_DATA_LAGS                   default "24,48,168"
+    PANELCAST_DATA_TRAIN_FRAC / _CAL_FRAC default 0.7 / 0.15
+
+  CREDENTIALS (all optional — synthetic fallback if absent)
+    ISO_NE_USERNAME / ISO_NE_PASSWORD     ISO-NE Web Services
+    EIA_API_KEY                           EIA Open Data (non-ISO-NE regions)
+    NOAA_TOKEN                            NOAA CDO weather (future use)
+
+  AGENTS
+    PANELCAST_AGENTS_PANEL                default "ridge,lightgbm,lstm,foundation_ts"
+    PANELCAST_AGENTS_USE_TUNED_PARAMS     default false (load results/best_params.json)
+    PANELCAST_AGENTS_LSTM_LOOKBACK        default 168 (hours)
+    PANELCAST_AGENTS_SAVE_DIR             default "saved_models"
+
+  UNCERTAINTY / CONFORMAL
+    PANELCAST_UNCERTAINTY_ALPHA           default 0.1 (→ 90% PI)
+    PANELCAST_UNCERTAINTY_MODE            default "split" (split|constant|two_sided|adaptive)
+    PANELCAST_UNCERTAINTY_ACI_GAMMA       default 0.005 (adaptive step size)
+    PANELCAST_UNCERTAINTY_CAL_MAX_STEPS   default 50 (how many calibration steps
+                                            to run — see PROGRESS.txt for notes
+                                            on tuning this for a faster first run)
+
+  ORCHESTRATION
+    PANELCAST_ORCH_RUNS_DIR               default "runs"
+    PANELCAST_ORCH_GATE_ENABLED           default false (human-in-the-loop gate)
+    PANELCAST_ORCH_PARALLEL_AGENTS        default true (ThreadPoolExecutor in R2)
+
+  INTERFACES
+    PANELCAST_IF_API_PORT                 default 8000
+    PANELCAST_IF_MCP_ENABLED              default false
+
+  REPRODUCIBILITY
+    PANELCAST_SEED                        default 42 (seeds numpy/random/torch/lightgbm)
+
+═══════════════════════════════════════════════════════════════════════════════
+DATA CONTRACT — AgentOutput (what every model-agent returns to the orchestrator)
+═══════════════════════════════════════════════════════════════════════════════
+
+  AgentOutput = {
+      "agent":       str,             # e.g. "lightgbm"
+      "y_hat":       list[float],     # length = horizon
+      "latency_ms":  float,
+      "cost_usd":    float | None,    # 0.0 for local models; nonzero for Chronos-class
+      "meta":        dict,            # {"error": str} present if the agent fell back
+  }
+
+  If an agent's fit/predict call raises, tools.py._fit_predict_one() catches
+  it and returns an AgentOutput with y_hat = [last known value] * horizon and
+  meta={"error": ...} instead of crashing the panel — this keeps the pipeline
+  running even if one model has a problem. Good habit: check meta for an
+  "error" key before treating an agent's output as a real forecast.

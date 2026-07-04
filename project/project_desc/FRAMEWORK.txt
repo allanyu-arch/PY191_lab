@@ -1,0 +1,335 @@
+================================================================================
+ AGENTIC FRAMEWORK WITH CODE — CUAD-STLF
+ Calibrated Uncertainty from Agent Disagreement — Short-Term Load Forecasting
+ Concepts 1–7: BRAIN · TOOLS · ORCHESTRATION · KNOWLEDGE · CORE LOGIC ·
+               SERVING/RUNNER · WIRING
+================================================================================
+
+HOW TO USE THIS FILE
+---------------------
+Same "concept → code" pattern used across this team's other projects (Bongard
+Specialist Debate, guidelines-generator). Read ARCHITECTURE.txt first for the
+one-page mental model; this file goes one level deeper into how each piece
+actually works. For a dated log of what's been built so far and what's being
+worked on next, see PROGRESS.txt in this same folder.
+
+================================================================================
+CONCEPT 1: BRAIN — the models that actually forecast
+================================================================================
+
+Unlike an LLM-orchestrated agent system, CUAD-STLF's "brains" are NOT language
+models reasoning in natural language — they are 7 classical/deep forecasting
+models, each wrapped behind one shared interface. There is no LLM in the
+critical path of producing a forecast. (An LLM could sit on top later as an
+operator-facing narrator — that's a nice future direction, not part of v1.)
+
+THE PANEL (src/cuad/agents/)
+  ridge            sklearn Ridge — linear baseline
+  lightgbm         LightGBM GBDT
+  xgboost          XGBoost GBDT
+  lstm             PyTorch LSTM, 168h lookback
+  sarima           statsmodels SARIMA
+  quantile         sklearn QuantileRegressor
+  foundation_ts    Amazon Chronos, zero-shot foundation time-series model
+
+  Default active panel (.env PANELCAST_AGENTS_PANEL): ridge, lightgbm, lstm,
+  foundation_ts. Some of these models need extra Python packages installed
+  before they'll run on a fresh machine — see BACKEND.txt's Configuration
+  section and PROGRESS.txt for setup notes.
+
+KEY DESIGN RULES
+  - Every agent seeds numpy/random/torch/lightgbm with the same seed
+    (PANELCAST_SEED) before every fit, for reproducibility regardless of
+    thread scheduling order (see agents/tools.py: set_global_seeds()).
+  - Agents never call each other. They are independent — that's what makes
+    their disagreement meaningful rather than circular.
+  - Heterogeneity is deliberate: linear, tree, recurrent, statistical, and
+    zero-shot foundation models each pick up on different patterns in the
+    same data, which is exactly what makes comparing their forecasts useful.
+
+IDEAS WORTH DISCUSSING
+  - Should the panel report which agents are actively contributing a real
+    forecast vs. which fell back (see Concept 2), so this is visible at a
+    glance rather than buried in a log?
+  - Is Chronos worth its extra cost/latency relative to the accuracy it adds?
+    A head-to-head comparison (see FRAMEWORK.txt Concept 6, ablation studies)
+    is the way to answer this with real numbers.
+  - Should trained agents be reused across runs via BaseAgent.save()/.load(),
+    instead of refitting from scratch each time?
+
+================================================================================
+CONCEPT 2: TOOLS — the shared model-agent interface
+================================================================================
+
+WHAT IT IS: every agent implements the same abstract contract
+(src/cuad/agents/base.py: BaseAgent), so the orchestrator can call any of
+them identically.
+
+  class BaseAgent(ABC):
+      def fit(self, X: pd.DataFrame, y: pd.Series, cfg: AgentConfig) -> BaseAgent
+      def predict(self, X: pd.DataFrame, horizon: int) -> AgentOutput
+      def save(self, path) / load(cls, path)     # pickle-based persistence
+
+  AgentOutput = {
+      "agent": str, "y_hat": list[float], "latency_ms": float,
+      "cost_usd": float | None, "meta": dict   # meta["error"] if fallback used
+  }
+
+FEATURE_COLS (base.py) — the 31 canonical feature names every agent may read
+  from features.parquet (lags, rolling stats, weather, calendar, Fourier
+  terms — full list in ARCHITECTURE.txt).
+
+MULTI-STEP FORECASTING (base.py: _recursive_multi_step)
+  Most agents predict one step and recurse: each future hour's lag/rolling
+  features are rebuilt from a growing buffer of real history + the model's
+  own prior predictions, and calendar features (hour, sin/cos) are advanced
+  cyclically. This produces a realistic diurnal curve instead of a flat or
+  linear extrapolation. Weather features are held constant from the last
+  observed row — an accepted simplification for 1–48h operational horizons.
+
+GRACEFUL FALLBACK (agents/tools.py: _fit_predict_one)
+  try:
+      agent.fit(...); return agent.predict(...)
+  except Exception:
+      return AgentOutput(y_hat=[last_known_value] * horizon, meta={"error": str(exc)})
+
+  This means one model having a problem never stops the whole panel from
+  running. Good habit for anyone analyzing results: check `meta` for an
+  "error" key before treating an agent's output as a real forecast — a
+  fallback forecast still shows up in the panel's output, it just isn't a
+  genuine model opinion.
+
+PARALLEL PANEL EXECUTION (agents/tools.py: run_panel)
+  parallel=True → ThreadPoolExecutor(max_workers=len(agents)), one thread per
+  agent, gathered with as_completed(). Needs at least 2 agents to succeed,
+  otherwise raises a clear error rather than silently returning a bad result.
+
+IDEAS WORTH DISCUSSING
+  - Should a fallback forecast be excluded from the disagreement calculation
+    (Concept 5), rather than blended in like a real model opinion? Right now
+    it counts the same as any other agent.
+  - Is pickle-based save/load the right long-term format, or should this move
+    to something more structured (ONNX, joblib + explicit schema) as the
+    project matures?
+
+================================================================================
+CONCEPT 3: ORCHESTRATION — LangGraph R1→R5
+================================================================================
+
+Why LangGraph: the human-gate loop-back (R5 → R2 on reject) needs a
+conditional edge, and every stage's input/output needs to be independently
+inspectable and resumable for audit purposes — LangGraph's StateGraph gives
+both for free.
+
+GRAPH (src/cuad/orchestration/graph.py)
+  StateGraph(ForecastState)
+  Nodes: r1_ingest, r2_panel, r3_aggregate, r4_calibrate, r5_output
+  Edges: START→r1→r2→r3→r4→r5
+  Conditional edge: r5 → route_after_output() → "r2_panel" | END
+
+  def route_after_output(state):
+      if state.get("gate_decision") == "reject": return "r2_panel"
+      return "end"
+
+STATE OBJECT (orchestration/state.py: ForecastState, TypedDict)
+  Full schema in ARCHITECTURE.txt. One small thing worth cleaning up
+  eventually: "_q_hat" is stored on state by r4_calibrate but isn't declared
+  in the ForecastState TypedDict yet — easy fix whenever someone is in that file.
+
+RESUME MECHANISM (orchestration/pipeline_runner.py: hydrate_from_run)
+  Given a prior run_id and a target stage (r1..r5), rebuilds ForecastState
+  from that run's saved JSON artifacts up through the stage before the resume
+  point, then runs the remaining stages forward with a NEW run_id. This is
+  what makes `cuad run --from-run <id> --stage r3` work.
+
+HUMAN GATE (orchestration/gate.py)
+  apply_gate() auto-approves ("auto") by default unless
+  PANELCAST_ORCH_GATE_ENABLED is set. The loop-back edge itself is fully
+  wired (route_after_output() correctly routes "reject" back to r2_panel) —
+  what's not built yet is an actual interface for a human to submit that
+  "reject" decision, so today it would need to be set programmatically.
+
+IDEAS WORTH DISCUSSING
+  - Should each node log explicitly if it can't make progress, so it's easy
+    to tell from telemetry.jsonl alone where a run is spending its time?
+  - Should the gate actually pause and wait for external input, rather than
+    only supporting a pre-supplied gate_decision at invocation time?
+
+================================================================================
+CONCEPT 4: KNOWLEDGE — the shared feature table (this system's "feature pool")
+================================================================================
+
+WHAT IT IS: analogous to a shared perception pool in a vision multi-agent
+system, features.parquet is built ONCE (R1) and every agent in the panel
+reads from the same table — no agent re-derives its own features from raw
+data, so all 7 agents are compared on a level playing field.
+
+FEATURE TABLE (src/cuad/data/feature_builder.py)
+  Rows: hourly, indexed by timestamp (8,616 rows for ISO-NE 2024 currently
+  on disk — just under a full year).
+  Columns: the 31 FEATURE_COLS (lags, rolling stats, weather, calendar,
+  Fourier terms, interaction, event flags) — see ARCHITECTURE.txt.
+  Leakage audit (data/leakage_audit.py): verifies ≥1h shift on every
+  lag/rolling feature before the file is written. Confirmed "passed" in the
+  current splits.json's own audit field.
+
+SPLITS (src/cuad/data/splits.py + data/processed/splits.json)
+  Strictly temporal, never shuffled: 70% train / 15% calibration / 15% test.
+  Current on-disk split (ISO-NE):
+    train: 2024-01-08 → 2024-09-15
+    cal:   2024-09-15 → 2024-11-08
+    test:  2024-11-08 → 2024-12-31
+  config_hash (sha256) is threaded through ForecastState for reproducibility
+  — any change to the feature/split config invalidates cached comparisons.
+
+SOURCES (src/cuad/data/sources/)
+  iso_ne.py, eia.py, weather.py, calendar.py are the real data fetchers;
+  synthetic.py provides a zero-credential fallback
+  (PANELCAST_DATA_USE_SYNTHETIC_IF_MISSING) so the pipeline still runs
+  without any API keys.
+
+IDEAS WORTH DISCUSSING
+  - Worth confirming whether the current features.parquet was built from
+    real ISO-NE + Open-Meteo data or the synthetic fallback — good first
+    check for anyone about to run an evaluation and quote numbers from it.
+  - Should feature engineering be extended per Hong et al.'s probabilistic
+    STLF recommendations?
+
+================================================================================
+CONCEPT 5: CORE LOGIC — disagreement → conformal calibration
+================================================================================
+
+This is the project's core mechanism (the analog to "debate mechanics" in an
+LLM multi-agent system) — worth understanding in full before touching
+uncertainty/ code.
+
+STEP 1 — AGGREGATE (uncertainty/aggregate.py: combine)
+  point_t = combine(ŷ¹_t, ..., ŷᴹ_t)     mean or median across agents
+
+STEP 2 — DISAGREEMENT (uncertainty/disagreement.py: spread)
+  s_t = spread(ŷ¹_t, ..., ŷᴹ_t)          std (or quantile range) across agents
+  This is the raw, uncalibrated uncertainty signal — informative, but on its
+  own it's a heuristic rather than a guarantee.
+
+STEP 3 — CALIBRATION SET CONSTRUCTION (orchestration/nodes/r4_calibrate.py)
+  For up to `calibration_max_steps` (default 50) points in the calibration
+  split:
+    1. re-run the full panel on a window ending at that point
+    2. record (point, spread, actual y) for that single step
+  This step is thorough by design — it re-checks the panel's behavior at
+  many points in time rather than relying on one snapshot — but it is also
+  the slowest part of the pipeline today. See PROGRESS.txt for the current
+  timing and ideas being considered to speed it up (running steps in
+  parallel, reusing a single fit instead of refitting each time, or starting
+  with fewer steps for a faster first pass).
+
+STEP 4 — CONFORMAL QUANTILE (uncertainty/conformal.py)
+  Normalized nonconformity score: r_t = |y_t - point_t| / max(spread_t, 1e-6)
+  q̂ = Quantile_{ceil((n+1)(1-α))/n} { r_t : t in calibration set }
+  (this is the textbook split-conformal formula — Lei et al. 2018 / Romano
+  et al. 2019 CQR)
+  Two-sided variant computes separate q_lo/q_hi from asymmetric scores.
+  Adaptive variant (ACI, Gibbs & Candès 2021) updates alpha_t online based on
+  whether each new point was covered, tracking coverage under regime shift.
+
+STEP 5 — APPLY INTERVAL (uncertainty/conformal.py: apply_interval)
+  interval = [point_t - q̂·s_t, point_t + q̂·s_t]
+  Normalizing by disagreement (not just using a constant q̂) is what makes the
+  interval adaptive — tight when the panel agrees, wide when it doesn't —
+  rather than constant-width.
+
+STEP 6 — ATTRIBUTION (uncertainty/attribution.py: attribute)
+  Per-agent deviation from the consensus point, so an operator/reviewer can
+  see e.g. "the foundation-model agent pulled the forecast up 340 MW; the
+  linear agent dissented."
+
+IDEAS WORTH DISCUSSING
+  - Should calibration reuse one fit across all calibration steps instead of
+    refitting per step? That would be faster, at the cost of being a little
+    less rigorous — worth weighing once there's a first working baseline to
+    compare against.
+  - Is std the right spread metric, or would quantile-range be more robust to
+    one unusual agent output in the panel?
+  - The project's core claim — that disagreement-normalized intervals beat a
+    simple constant-width interval — is exactly what eval/ablation.py is
+    built to test. Running that comparison once a full pipeline run
+    completes is the natural next milestone (see PROGRESS.txt).
+
+================================================================================
+CONCEPT 6: SERVING / RUNNER — evaluation and benchmark harness
+================================================================================
+
+WHAT IT IS: not a web server — the research harness that turns a pipeline
+run (or many) into the tables a paper would need.
+
+EVALUATION (src/cuad/eval/)
+  metrics.py     MAPE, RMSE, MAE, PICP (coverage), PINAW, CWC, Winkler,
+                 DM-test, Energy Score
+  runner.py      run_evaluation() / run_benchmark()
+  ablation.py    run_agent_ablation() / run_conformal_ablation()
+  time_series_cv.py  walk-forward CV eval + tuning
+  baselines.py   naive / persistence baselines
+  grid_ops.py    grid-operator risk metrics
+
+All of these are built and ready to use. The natural order to run them in is:
+`cuad eval` first for a baseline number, then `--ablation` to see how much
+the disagreement-based approach helps relative to simpler alternatives. See
+PROGRESS.txt for exactly where this stands today.
+
+RUN AUDIT BUNDLE (orchestration/audit.py, artifact_layout.py)
+  runs/<run_id>/
+  ├── meta/index.json       manifest: region, horizon, config_hash, artifacts
+  ├── r1_features.json      features_ref, splits_ref, config_hash
+  ├── r2_panel.json         every agent's y_hat + latency + cost + meta
+  ├── r3_aggregate.json     point + disagreement
+  ├── r4_calibrate.json     q_hat, interval, attribution
+  ├── r5_output.json        final forecast + gate decision
+  └── telemetry.jsonl       one JSON line per stage: {stage, ts, detail,
+                             duration_ms, cost_usd?}
+
+  Every stage's artifact writes append-only (append_telemetry) so a run can
+  be inspected mid-flight or resumed after an interruption.
+
+IDEAS WORTH DISCUSSING
+  - Would it help to log an explicit "stage X still running" or "stage X hit
+    an error" line to telemetry.jsonl, so anyone watching a long run can tell
+    what's happening without extra instrumentation?
+  - For a first full run, is it worth starting with a smaller
+    calibration_max_steps to get a fast result, then scaling up once
+    everything is confirmed correct?
+
+================================================================================
+CONCEPT 7: WIRING — how everything connects end-to-end
+================================================================================
+
+FULL PIPELINE WIRING (as coded, src/cuad/orchestration/pipeline_runner.py)
+
+  CLI/API/MCP call run_pipeline(region, horizon, ...)
+    → if features.parquet missing and ensure_data: build_dataset() runs R1's
+      data prep inline
+    → graph = build_graph()   (compiles the LangGraph StateGraph once)
+    → graph.invoke(initial_state)
+        r1_ingest      → loads features/splits, computes config_hash
+        r2_panel       → run_panel(parallel=True) across active agents
+        r3_aggregate   → combine() + spread()
+        r4_calibrate   → re-run panel per cal step → conformal q_hat →
+                          interval → attribution
+        r5_output      → apply_gate() → persist_run_bundle() → audit_path
+        route_after_output() → "r2_panel" (reject) or END
+    → caller receives the final ForecastState
+
+Every piece above is written and connected. PROGRESS.txt tracks how far a
+run currently gets end to end and what's being worked on to get a full run
+finishing reliably.
+
+IDEAS WORTH DISCUSSING
+  - Would an async version of graph.invoke() meaningfully help, given R2 is
+    already threaded? (Worth checking whether Concept 5's calibration speed
+    work addresses this first, since that's the bigger time cost.)
+  - Once a full run reliably finishes, is there a fast "smoke test" preset
+    (small horizon, small calibration_max_steps, 2-agent panel) worth adding
+    as a quick sanity check before a full experiment run?
+
+================================================================================
+END
+================================================================================
