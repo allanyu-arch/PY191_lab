@@ -52,7 +52,7 @@ def get_stock(ticker, start_date, end_date, s_window, l_window):
 # Example usage
 if __name__ == "__main__":
     try:
-        ticker = "nok"
+        ticker = "spy"
         output_file = os.path.join(os.getcwd(), f"{ticker}.csv")
 
         # Get stock data
